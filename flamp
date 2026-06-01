@@ -1,0 +1,263 @@
+#!/bin/bash
+set -o nounset -o pipefail -o errexit
+
+# Run an Amp prompt on a Fly Machine against a given branch, then push to origin.
+#
+# Usage:
+#   ./fly-amp.sh <branch> "your prompt here" [path-or-glob ...]
+#   ./fly-amp.sh <branch> @prompt.md [path-or-glob ...]
+#   ./fly-amp.sh <branch> - [path-or-glob ...]   # read prompt from stdin
+#   cmd | ./fly-amp.sh <branch>                  # read prompt from stdin (bare form)
+#
+# Extra path/glob args are copied into the cloned repo on the Fly Machine at
+# the same relative path (e.g. logs/run.log on the client -> $HOME/work/logs/run.log
+# on the server). They're added to .git/info/exclude so they won't be committed
+# even if they're not in .gitignore. Globs that match nothing are silently
+# skipped. Useful for shipping secrets, logs, or user data that the cloud agent
+# needs but that shouldn't live in the repo.
+#
+# Required environment variables:
+#   AMP_API_KEY        - Amp API key (from ampcode.com/settings)
+#   CLOUD_SSH_KEY_PATH - Path to SSH private key with push access to the repo
+#
+# Optional:
+#   FLY_APP           - Fly app name (default: amp-runner)
+#   FLY_REGION        - Fly region (default: ord, since ampcode.com is in us-central)
+#   FLY_VM_SIZE       - VM size (default: shared-cpu-2x)
+#   FLY_VM_MEMORY     - VM memory in MB (default: 2048)
+
+FLY_APP="${FLY_APP:-amp-runner}"
+FLY_REGION="${FLY_REGION:-ord}"
+FLY_VM_SIZE="${FLY_VM_SIZE:-shared-cpu-2x}"
+FLY_VM_MEMORY="${FLY_VM_MEMORY:-2048}"
+
+REMOTE_URL="$(git remote get-url origin 2>/dev/null)" || {
+  echo "Error: not in a git repository or no 'origin' remote"
+  exit 1
+}
+# Convert HTTPS URL to SSH if needed
+if [[ "$REMOTE_URL" == https://github.com/* ]]; then
+  REPO_URL="git@github.com:${REMOTE_URL#https://github.com/}"
+else
+  REPO_URL="$REMOTE_URL"
+fi
+
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <branch> [\"prompt\" | @prompt-file.md | -] [path-or-glob ...]"
+  echo "       cmd | $0 <branch> [path-or-glob ...]"
+  exit 1
+fi
+
+BRANCH="$1"
+shift
+
+# If only the branch was given and stdin is piped, read the prompt from stdin.
+if [[ $# -eq 0 ]]; then
+  if [[ -t 0 ]]; then
+    echo "Error: no prompt given and stdin is a terminal"
+    exit 1
+  fi
+  PROMPT="$(cat)"
+  EXTRA_PATTERNS=()
+else
+  PROMPT_ARG="$1"
+  shift
+  EXTRA_PATTERNS=("$@")
+
+  if [[ "$PROMPT_ARG" == "-" ]]; then
+    if [[ -t 0 ]]; then
+      echo "Error: prompt is '-' but stdin is a terminal"
+      exit 1
+    fi
+    PROMPT="$(cat)"
+  elif [[ "$PROMPT_ARG" == @* ]]; then
+    PROMPT_FILE="${PROMPT_ARG#@}"
+    if [[ ! -f "$PROMPT_FILE" ]]; then
+      echo "Error: prompt file not found: $PROMPT_FILE"
+      exit 1
+    fi
+    PROMPT="$(cat "$PROMPT_FILE")"
+  else
+    PROMPT="$PROMPT_ARG"
+  fi
+fi
+
+if [[ -z "$PROMPT" ]]; then
+  echo "Error: prompt is empty"
+  exit 1
+fi
+
+if [[ -z "${AMP_API_KEY:-}" ]]; then
+  echo "Error: AMP_API_KEY environment variable is required"
+  exit 1
+fi
+
+if [[ -z "${CLOUD_SSH_KEY_PATH:-}" ]]; then
+  echo "Error: CLOUD_SSH_KEY_PATH environment variable is required"
+  exit 1
+fi
+
+if [[ ! -f "$CLOUD_SSH_KEY_PATH" ]]; then
+  echo "Error: SSH key not found: $CLOUD_SSH_KEY_PATH"
+  exit 1
+fi
+
+SSH_KEY_PATH="$CLOUD_SSH_KEY_PATH"
+
+AMP_DOCKERFILE="Dockerfile.amp"
+if [[ ! -f "$AMP_DOCKERFILE" ]]; then
+  echo "==> Generating Dockerfile for project dependencies..."
+  echo "Generate a development Dockerfile based on the project files in this repository. The image should have all dev dependencies pre-installed for all stacks used (Python/js/Rust/etc). Do not include the project itself. Use a suitable base image. Save into Dockerfile.amp" \
+    | amp -x -m smart --dangerously-allow-all
+
+  if [[ ! -s "$AMP_DOCKERFILE" ]]; then
+    echo "Error: failed to generate Dockerfile"
+    rm -f "$AMP_DOCKERFILE"
+    exit 1
+  fi
+
+  # Append amp installation
+  cat >> "$AMP_DOCKERFILE" <<'AMPEOF'
+
+# Install openssh-client (needed for git over ssh) and ripgrep (gpt loves it)
+RUN (apk add --no-cache openssh-client ripgrep || \
+     (apt-get update && apt-get install -y openssh-client ripgrep) || \
+     dnf install -y openssh-clients ripgrep || \
+     echo "ssh/ripgrep not installed, skipping...") || true
+
+# Install amp CLI
+RUN curl -fsSL https://ampcode.com/install.sh | bash
+ENV PATH="/root/.amp/bin:${PATH}"
+AMPEOF
+else
+  echo "==> Using existing $AMP_DOCKERFILE"
+fi
+
+# Collect any extra files/globs into a tarball to ship to the machine.
+EXTRA_TAR=""
+EXTRA_FILE_COUNT=0
+if [[ ${#EXTRA_PATTERNS[@]} -gt 0 ]]; then
+  shopt -s nullglob
+  EXTRA_FILES=()
+  for pattern in "${EXTRA_PATTERNS[@]}"; do
+    # Intentional unquoted expansion so $pattern is glob-expanded; nullglob
+    # makes the loop iterate zero times when nothing matches.
+    for f in $pattern; do
+      if [[ -e "$f" ]]; then
+        EXTRA_FILES+=("$f")
+      fi
+    done
+  done
+  shopt -u nullglob
+
+  if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
+    EXTRA_TAR="$(mktemp -t flamp-extras.XXXXXX).tar"
+    trap 'rm -f "$EXTRA_TAR"' EXIT
+    tar -cf "$EXTRA_TAR" "${EXTRA_FILES[@]}"
+    EXTRA_FILE_COUNT="${#EXTRA_FILES[@]}"
+    echo "==> Shipping $EXTRA_FILE_COUNT extra file(s) into the cloned repo"
+  else
+    echo "==> No extra files matched, skipping"
+  fi
+fi
+
+# Build the script that will run inside the Fly Machine
+RUNNER_SCRIPT="$(cat <<RUNNER_EOF
+#!/bin/bash
+set -o nounset -o pipefail -o errexit
+
+export HOME=/tmp/home
+mkdir -p "\$HOME"
+
+echo "==> Setting up SSH key..."
+chmod 600 /ssh-key
+export GIT_SSH_COMMAND="ssh -i /ssh-key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+echo "==> Cloning repo and checking out branch..."
+git clone --depth=50 "$REPO_URL" "\$HOME/work"
+cd "\$HOME/work"
+if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+  git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH"
+  if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    git checkout "$BRANCH"
+    git reset --hard "origin/$BRANCH"
+  else
+    git checkout -b "$BRANCH" "origin/$BRANCH"
+  fi
+else
+  git checkout -b "$BRANCH"
+fi
+
+git config user.name "amp for Vadim Liventsev"
+git config user.email "dev@vadim.me"
+
+if [[ -f /extra-files.tar ]]; then
+  echo "==> Extracting extra files into repo..."
+  tar -xf /extra-files.tar -C "\$HOME/work"
+  # Prevent these files from being committed even if not in .gitignore.
+  mkdir -p "\$HOME/work/.git/info"
+  tar -tf /extra-files.tar | while IFS= read -r path; do
+    # Skip directory entries (trailing slash).
+    [[ "\$path" == */ ]] && continue
+    echo "/\$path" >> "\$HOME/work/.git/info/exclude"
+  done
+fi
+
+echo "==> Creating amp thread..."
+THREAD_ID="\$(amp threads new)"
+echo "Thread: \$THREAD_ID"
+
+echo "==> Running amp in deep mode..."
+cat /prompt.txt | amp threads continue "\$THREAD_ID" -x -m deep --dangerously-allow-all
+
+echo "==> Committing..."
+git add -A
+if git diff --cached --quiet; then
+  echo "No changes to commit."
+else
+  COMMIT_MSG="amp \$THREAD_ID"
+  git commit -m "\$COMMIT_MSG"
+
+  echo "==> Pulling latest from origin/$BRANCH..."
+  if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
+    if ! git pull --no-edit --no-rebase origin "$BRANCH"; then
+      echo "==> Merge conflicts detected, asking amp to resolve..."
+      echo "Resolve all merge conflicts in this repository. After resolving, stage the resolved files with git add. Do not commit." \
+        | amp -x -m rush --dangerously-allow-all
+      if git diff --name-only --diff-filter=U | grep -q .; then
+        echo "Error: merge conflicts remain after amp rush"
+        exit 1
+      fi
+      git commit --no-edit
+    fi
+  fi
+
+  echo "==> Pushing to origin/$BRANCH..."
+  git push origin "$BRANCH"
+  echo "==> Pushed to origin/$BRANCH"
+fi
+RUNNER_EOF
+)"
+
+echo "==> Launching Fly Machine (app=$FLY_APP, region=$FLY_REGION, branch=$BRANCH)..."
+EXTRA_FILE_ARGS=()
+if [[ -n "$EXTRA_TAR" ]]; then
+  EXTRA_FILE_ARGS+=(--file-local "/extra-files.tar=$EXTRA_TAR")
+fi
+
+fly machine run . bash /run-amp.sh \
+  --dockerfile "$AMP_DOCKERFILE" \
+  --app "$FLY_APP" \
+  --region "$FLY_REGION" \
+  --vm-size "$FLY_VM_SIZE" \
+  --vm-memory "$FLY_VM_MEMORY" \
+  --env "AMP_API_KEY=$AMP_API_KEY" \
+  --env "DEBIAN_FRONTEND=noninteractive" \
+  --restart no \
+  --rm \
+  --file-literal /run-amp.sh="$RUNNER_SCRIPT" \
+  --file-literal /prompt.txt="$PROMPT" \
+  --file-local /ssh-key="$SSH_KEY_PATH" \
+  ${EXTRA_FILE_ARGS[@]+"${EXTRA_FILE_ARGS[@]}"}
+
+echo "==> Done."
