@@ -208,7 +208,7 @@ THREAD_ID="\$(amp threads new)"
 echo "Thread: \$THREAD_ID"
 
 echo "==> Running amp in deep mode..."
-cat /prompt.txt | amp threads continue "\$THREAD_ID" -x -m deep --dangerously-allow-all
+cat /prompt.txt | amp threads continue "\$THREAD_ID" -x -m deep --effort xhigh --dangerously-allow-all
 
 echo "==> Committing..."
 git add -A
