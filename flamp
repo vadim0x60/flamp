@@ -203,12 +203,16 @@ if [[ -f /extra-files.tar ]]; then
   done
 fi
 
-echo "==> Creating amp thread..."
-THREAD_ID="\$(amp threads new)"
+echo "==> Running amp in deep mode (effort xhigh)..."
+# Note: --effort only takes effect on the command that CREATES the thread (the
+# root 'amp -x' form). 'amp threads continue' silently ignores --effort, so we
+# must run the prompt directly here rather than pre-creating the thread with
+# 'amp threads new'. We recover the thread ID from the log for the commit msg.
+AMP_LOG=/tmp/amp-run.log
+rm -f "\$AMP_LOG"
+cat /prompt.txt | amp -x -m deep --effort xhigh --dangerously-allow-all --log-file "\$AMP_LOG"
+THREAD_ID="\$(grep -oE 'T-[0-9a-f-]{36}' "\$AMP_LOG" | head -1)"
 echo "Thread: \$THREAD_ID"
-
-echo "==> Running amp in deep mode..."
-cat /prompt.txt | amp threads continue "\$THREAD_ID" -x -m deep --effort xhigh --dangerously-allow-all
 
 echo "==> Committing..."
 git add -A
