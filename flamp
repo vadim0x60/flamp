@@ -211,7 +211,7 @@ echo "==> Running amp in deep mode (effort xhigh)..."
 AMP_LOG=/tmp/amp-run.log
 rm -f "\$AMP_LOG"
 cat /prompt.txt | amp -x -m deep --effort xhigh --dangerously-allow-all --log-file "\$AMP_LOG"
-THREAD_ID="\$(grep -oE 'T-[0-9a-f-]{36}' "\$AMP_LOG" | head -1)"
+THREAD_ID="\$(grep -m1 -oE 'T-[0-9a-f-]{36}' "\$AMP_LOG")"
 echo "Thread: \$THREAD_ID"
 
 echo "==> Committing..."
