@@ -107,7 +107,7 @@ SSH_KEY_PATH="$CLOUD_SSH_KEY_PATH"
 AMP_DOCKERFILE="Dockerfile.amp"
 if [[ ! -f "$AMP_DOCKERFILE" ]]; then
   echo "==> Generating Dockerfile for project dependencies..."
-  echo "Generate a development Dockerfile based on the project files in this repository. The image should have all dev dependencies pre-installed for all stacks used (Python/js/Rust/etc). Do not include the project itself. Use a suitable base image. Save into Dockerfile.amp" \
+  echo "Generate a development Dockerfile based on the project files in this repository. The image should have all dev dependencies pre-installed for all stacks used (Python/js/Rust/etc). Do not include the project itself. Use a suitable base image. IMPORTANT: at runtime the container is launched with HOME set to /tmp/home, so any caches under the default HOME (e.g. /root/.cache) are lost. To keep pre-installed/cached packages usable at runtime, do NOT disable package caches (do not use pip --no-cache-dir, etc.) and pin all package manager caches to absolute, HOME-independent locations under /opt/pkgcache via ENV (e.g. PIP_CACHE_DIR=/opt/pkgcache/pip, npm_config_cache=/opt/pkgcache/npm, npm_config_store_dir=/opt/pkgcache/pnpm, CARGO_HOME=/opt/cargo) so that packages installed at build time are reused instantly at runtime. Save into Dockerfile.amp" \
     | amp -x -m smart --dangerously-allow-all
 
   if [[ ! -s "$AMP_DOCKERFILE" ]]; then
