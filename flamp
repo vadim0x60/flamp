@@ -25,9 +25,9 @@ set -o nounset -o pipefail -o errexit
 #   FLY_REGION        - Fly region (default: ord, since ampcode.com is in us-central)
 #   FLY_VM_SIZE       - VM size (default: shared-cpu-2x)
 #   FLY_VM_MEMORY     - VM memory in MB (default: 2048)
-#   FLAMP_NTFY_TOPIC        - ntfy topic to push amp's return message to (e.g. your phone).
-#                       If unset, no notification is sent.
-#   FLAMP_NTFY_SERVER       - ntfy server base URL (default: https://ntfy.sh)
+#   FLAMP_PUSHOVER_TOKEN - Pushover application API token.
+#   FLAMP_PUSHOVER_USER  - Pushover user or group key.
+#                          If either is unset, no notification is sent.
 
 FLY_APP="${FLY_APP:-amp-runner}"
 FLY_REGION="${FLY_REGION:-ord}"
@@ -218,17 +218,32 @@ cat /prompt.txt | amp -x -m deep --effort xhigh --dangerously-allow-all --log-fi
 THREAD_ID="\$(grep -m1 -oE 'T-[0-9a-f-]{36}' "\$AMP_LOG")"
 echo "Thread: \$THREAD_ID"
 
-# Push amp's return message to the user's phone via ntfy.
-if [[ -n "\${FLAMP_NTFY_TOPIC:-}" ]]; then
-  echo "==> Sending amp's return message to ntfy..."
-  [[ -s "\$AMP_OUTPUT" ]] || echo "(amp produced no output)" > "\$AMP_OUTPUT"
-  curl -fsSL \
-    -H "Title: flamp deep on $BRANCH" \
-    -H "Tags: robot" \
-    --data-binary @"\$AMP_OUTPUT" \
-    "\${FLAMP_NTFY_SERVER:-https://ntfy.sh}/\$FLAMP_NTFY_TOPIC" > /dev/null \
-    && echo "==> Sent to ntfy topic \$FLAMP_NTFY_TOPIC" \
-    || echo "==> Warning: ntfy notification failed"
+# Push amp's return message to the user's phone via Pushover.
+if [[ -n "\${FLAMP_PUSHOVER_TOKEN:-}" || -n "\${FLAMP_PUSHOVER_USER:-}" ]]; then
+  if [[ -z "\${FLAMP_PUSHOVER_TOKEN:-}" || -z "\${FLAMP_PUSHOVER_USER:-}" ]]; then
+    echo "==> Warning: Pushover notification skipped; set both FLAMP_PUSHOVER_TOKEN and FLAMP_PUSHOVER_USER"
+  else
+    echo "==> Sending amp's return message to Pushover..."
+    PUSHOVER_MESSAGE=/tmp/pushover-message.txt
+    if [[ ! -s "\$AMP_OUTPUT" ]]; then
+      echo "(amp produced no output)" > "\$PUSHOVER_MESSAGE"
+    elif [[ "\$(wc -c < "\$AMP_OUTPUT")" -gt 900 ]]; then
+      {
+        echo "(truncated; last 900 bytes of amp output)"
+        tail -c 900 "\$AMP_OUTPUT"
+      } > "\$PUSHOVER_MESSAGE"
+    else
+      cp "\$AMP_OUTPUT" "\$PUSHOVER_MESSAGE"
+    fi
+    curl -fsSL \
+      --form-string "token=\$FLAMP_PUSHOVER_TOKEN" \
+      --form-string "user=\$FLAMP_PUSHOVER_USER" \
+      --form-string "title=flamp deep on $BRANCH" \
+      --form-string "message=\$(cat "\$PUSHOVER_MESSAGE")" \
+      https://api.pushover.net/1/messages.json > /dev/null \
+      && echo "==> Sent Pushover notification" \
+      || echo "==> Warning: Pushover notification failed"
+  fi
 fi
 
 echo "==> Committing..."
@@ -273,8 +288,8 @@ fly machine run . bash /run-amp.sh \
   --vm-size "$FLY_VM_SIZE" \
   --vm-memory "$FLY_VM_MEMORY" \
   --env "AMP_API_KEY=$AMP_API_KEY" \
-  --env "FLAMP_NTFY_TOPIC=${FLAMP_NTFY_TOPIC:-}" \
-  --env "FLAMP_NTFY_SERVER=${FLAMP_NTFY_SERVER:-https://ntfy.sh}" \
+  --env "FLAMP_PUSHOVER_TOKEN=${FLAMP_PUSHOVER_TOKEN:-}" \
+  --env "FLAMP_PUSHOVER_USER=${FLAMP_PUSHOVER_USER:-}" \
   --env "DEBIAN_FRONTEND=noninteractive" \
   --restart no \
   --rm \
