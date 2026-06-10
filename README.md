@@ -2,9 +2,7 @@
 
 **agentic engineering with wings**
 
-`flamp` runs an Amp prompt on a disposable Fly Machine, commits the result, and pushes it back to your GitHub branch.
-
-It is useful when you want Amp to work in a clean cloud environment with the repository, project dependencies, SSH push access, and optional extra local files such as logs or secrets.
+`flamp` runs an Amp prompt on a disposable Fly Machine, commits the result, and pushes it back to your GitHub branch. Launch your engine, close your laptop, get a push notification to your phoen when it's done.
 
 ## Requirements
 
