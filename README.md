@@ -32,6 +32,14 @@ Examples:
 cat prompt.md | ./flamp feature/new-api
 ```
 
+Pass `HEAD` as the branch to use your currently checked-out branch:
+
+```bash
+./flamp HEAD @prompt.md
+```
+
+The Fly Machine clones from `origin`, so the branch (including `HEAD`) must already be pushed with the commits you want Amp to work from — uncommitted local changes are not picked up.
+
 Extra path or glob arguments are copied into the cloned repository on the Fly Machine at the same relative path. They are added to `.git/info/exclude` there, so they are available to Amp but are not committed.
 
 ## Configuration

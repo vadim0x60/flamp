@@ -53,6 +53,16 @@ fi
 BRANCH="$1"
 shift
 
+# Allow "HEAD" as a shorthand for the currently checked-out branch.
+if [[ "$BRANCH" == "HEAD" ]]; then
+  BRANCH="$(git branch --show-current)"
+  if [[ -z "$BRANCH" ]]; then
+    echo "Error: HEAD given but not on a branch (detached HEAD)"
+    exit 1
+  fi
+  echo "==> Resolved HEAD to current branch: $BRANCH"
+fi
+
 # If only the branch was given and stdin is piped, read the prompt from stdin.
 if [[ $# -eq 0 ]]; then
   if [[ -t 0 ]]; then
