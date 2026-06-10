@@ -163,11 +163,18 @@ if [[ ${#EXTRA_PATTERNS[@]} -gt 0 ]]; then
   shopt -u nullglob
 
   if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
-    EXTRA_TAR="$(mktemp -t flamp-extras.XXXXXX).tar"
+    EXTRA_TAR="$(mktemp -t flamp-extras.XXXXXX).tar.gz"
     trap 'rm -f "$EXTRA_TAR"' EXIT
-    tar -cf "$EXTRA_TAR" "${EXTRA_FILES[@]}"
+    tar -czf "$EXTRA_TAR" "${EXTRA_FILES[@]}"
     EXTRA_FILE_COUNT="${#EXTRA_FILES[@]}"
-    echo "==> Shipping $EXTRA_FILE_COUNT extra file(s) into the cloned repo"
+    EXTRA_TAR_BYTES="$(wc -c < "$EXTRA_TAR")"
+    echo "==> Shipping $EXTRA_FILE_COUNT extra file(s) ($((EXTRA_TAR_BYTES / 1024)) KiB compressed) into the cloned repo"
+    # Files are base64-embedded into the Fly machine-create request (~33% larger).
+    # Fly rejects oversized request bodies, so warn before we even try.
+    if [[ "$EXTRA_TAR_BYTES" -gt 4194304 ]]; then
+      echo "==> Warning: compressed extras are $((EXTRA_TAR_BYTES / 1048576)) MiB; Fly may reject the launch (\"request body too large\")."
+      echo "    Consider attaching fewer files, or fetching large data inside the machine instead."
+    fi
   else
     echo "==> No extra files matched, skipping"
   fi
