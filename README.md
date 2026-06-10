@@ -47,6 +47,8 @@ Environment variable | Default | Description
 `FLAMP_PUSHOVER_TOKEN` | unset | Optional Pushover application API token for Amp's final output.
 `FLAMP_PUSHOVER_USER` | unset | Optional Pushover user or group key for Amp's final output.
 
+(`ord` is the closest fly region to ampcode.com)
+
 ## How it works
 
 1. Reads the prompt from an argument, `@file`, `-`, or stdin.
