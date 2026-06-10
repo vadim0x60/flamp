@@ -25,6 +25,9 @@ set -o nounset -o pipefail -o errexit
 #   FLY_REGION        - Fly region (default: ord, since ampcode.com is in us-central)
 #   FLY_VM_SIZE       - VM size (default: shared-cpu-2x)
 #   FLY_VM_MEMORY     - VM memory in MB (default: 2048)
+#   FLAMP_NTFY_TOPIC        - ntfy topic to push amp's return message to (e.g. your phone).
+#                       If unset, no notification is sent.
+#   FLAMP_NTFY_SERVER       - ntfy server base URL (default: https://ntfy.sh)
 
 FLY_APP="${FLY_APP:-amp-runner}"
 FLY_REGION="${FLY_REGION:-ord}"
@@ -209,10 +212,24 @@ echo "==> Running amp in deep mode (effort xhigh)..."
 # must run the prompt directly here rather than pre-creating the thread with
 # 'amp threads new'. We recover the thread ID from the log for the commit msg.
 AMP_LOG=/tmp/amp-run.log
-rm -f "\$AMP_LOG"
-cat /prompt.txt | amp -x -m deep --effort xhigh --dangerously-allow-all --log-file "\$AMP_LOG"
+AMP_OUTPUT=/tmp/amp-output.txt
+rm -f "\$AMP_LOG" "\$AMP_OUTPUT"
+cat /prompt.txt | amp -x -m deep --effort xhigh --dangerously-allow-all --log-file "\$AMP_LOG" | tee "\$AMP_OUTPUT"
 THREAD_ID="\$(grep -m1 -oE 'T-[0-9a-f-]{36}' "\$AMP_LOG")"
 echo "Thread: \$THREAD_ID"
+
+# Push amp's return message to the user's phone via ntfy.
+if [[ -n "\${FLAMP_NTFY_TOPIC:-}" ]]; then
+  echo "==> Sending amp's return message to ntfy..."
+  [[ -s "\$AMP_OUTPUT" ]] || echo "(amp produced no output)" > "\$AMP_OUTPUT"
+  curl -fsSL \
+    -H "Title: flamp deep on $BRANCH" \
+    -H "Tags: robot" \
+    --data-binary @"\$AMP_OUTPUT" \
+    "\${FLAMP_NTFY_SERVER:-https://ntfy.sh}/\$FLAMP_NTFY_TOPIC" > /dev/null \
+    && echo "==> Sent to ntfy topic \$FLAMP_NTFY_TOPIC" \
+    || echo "==> Warning: ntfy notification failed"
+fi
 
 echo "==> Committing..."
 git add -A
@@ -256,6 +273,8 @@ fly machine run . bash /run-amp.sh \
   --vm-size "$FLY_VM_SIZE" \
   --vm-memory "$FLY_VM_MEMORY" \
   --env "AMP_API_KEY=$AMP_API_KEY" \
+  --env "FLAMP_NTFY_TOPIC=${FLAMP_NTFY_TOPIC:-}" \
+  --env "FLAMP_NTFY_SERVER=${FLAMP_NTFY_SERVER:-https://ntfy.sh}" \
   --env "DEBIAN_FRONTEND=noninteractive" \
   --restart no \
   --rm \
