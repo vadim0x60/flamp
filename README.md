@@ -44,8 +44,7 @@ Environment variable | Default | Description
 `FLY_REGION` | `ord` | Fly region for the Machine.
 `FLY_VM_SIZE` | `shared-cpu-2x` | Fly Machine CPU size.
 `FLY_VM_MEMORY` | `2048` | Fly Machine memory in MB.
-`FLAMP_PUSHOVER_TOKEN` | unset | Optional Pushover application API token for Amp's final output.
-`FLAMP_PUSHOVER_USER` | unset | Optional Pushover user or group key for Amp's final output.
+`FLAMP_SIMPLEPUSH_KEY` | unset | Optional Simplepush key for Amp's final output.
 
 (`ord` is the closest fly region to ampcode.com)
 
