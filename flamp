@@ -9,7 +9,7 @@ set -o nounset -o pipefail -o errexit
 #   ./fly-amp.sh <branch> - [path-or-glob ...]   # read prompt from stdin
 #   cmd | ./fly-amp.sh <branch>                  # read prompt from stdin (bare form)
 #
-# Extra path/glob args are copied into the cloned repo on the Fly Machine at
+# Extra path/glob args are copied into the checked-out repo on the Fly Machine at
 # the same relative path (e.g. logs/run.log on the client -> $HOME/work/logs/run.log
 # on the server). They're added to .git/info/exclude so they won't be committed
 # even if they're not in .gitignore. Globs that match nothing are silently
@@ -116,17 +116,51 @@ fi
 
 SSH_KEY_PATH="$CLOUD_SSH_KEY_PATH"
 
+CLEANUP_PATHS=()
+cleanup() {
+  for path in "${CLEANUP_PATHS[@]}"; do
+    rm -rf "$path"
+  done
+}
+trap cleanup EXIT
+
+DEFAULT_BRANCH="$(git remote show origin 2>/dev/null | sed -n 's/^[[:space:]]*HEAD branch: //p' || true)"
+if [[ -z "$DEFAULT_BRANCH" || "$DEFAULT_BRANCH" == "(unknown)" ]]; then
+  DEFAULT_BRANCH="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  DEFAULT_BRANCH="${DEFAULT_BRANCH#origin/}"
+fi
+if [[ -z "$DEFAULT_BRANCH" || "$DEFAULT_BRANCH" == "(unknown)" ]]; then
+  echo "Error: could not determine origin's default branch"
+  exit 1
+fi
+
+BUILD_CONTEXT="$(mktemp -d -t flamp-context.XXXXXX)"
+CLEANUP_PATHS+=("$BUILD_CONTEXT")
+echo "==> Preparing Docker build context from origin/$DEFAULT_BRANCH..."
+git clone --depth=50 --branch "$DEFAULT_BRANCH" --single-branch "$REMOTE_URL" "$BUILD_CONTEXT" >/dev/null
+
 AMP_DOCKERFILE="Dockerfile.amp"
 if [[ ! -f "$AMP_DOCKERFILE" ]]; then
   echo "==> Generating Dockerfile for project dependencies..."
-  echo "Generate a minimal development Dockerfile for this repository. Do not include direct dependencies (requirements.txt, node_modules), do include everything those dependecies need. Save into Dockerfile.amp" \
-    | amp -x -m smart --dangerously-allow-all
+  (
+    cd "$BUILD_CONTEXT"
+    cat <<'PROMPT_EOF' | amp -x -m smart --dangerously-allow-all
+Generate a minimal development Dockerfile for this repository and save it as Dockerfile.amp.
 
-  if [[ ! -s "$AMP_DOCKERFILE" ]]; then
+flamp will build this Dockerfile from a temporary clean checkout of the repository's default branch as the Docker build context. The Dockerfile must:
+- copy that repository checkout, including .git, into /tmp/home/work and set WORKDIR /tmp/home/work;
+- install all project dependencies needed for development based on the repository's setup files, such as pip install -r requirements*.txt, pip install -e ., npm/pnpm/yarn install, make install-deps, or the repo's documented equivalent;
+- not clone the repository, run tests, or rely on uncommitted local worktree files.
+PROMPT_EOF
+  )
+
+  if [[ ! -s "$BUILD_CONTEXT/$AMP_DOCKERFILE" ]]; then
     echo "Error: failed to generate Dockerfile"
     rm -f "$AMP_DOCKERFILE"
     exit 1
   fi
+
+  cp "$BUILD_CONTEXT/$AMP_DOCKERFILE" "$AMP_DOCKERFILE"
 
   # Append amp installation
   cat >> "$AMP_DOCKERFILE" <<'AMPEOF'
@@ -144,6 +178,26 @@ AMPEOF
 else
   echo "==> Using existing $AMP_DOCKERFILE"
 fi
+
+# Restore the temporary checkout after Dockerfile generation, then copy in the
+# final Dockerfile. The build context should contain only origin's default
+# branch (plus Dockerfile.amp as the build recipe), never the local worktree.
+git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
+git -C "$BUILD_CONTEXT" clean -fdx >/dev/null
+cp "$AMP_DOCKERFILE" "$BUILD_CONTEXT/$AMP_DOCKERFILE"
+
+# The temporary checkout is already clean, so don't let the repo's own
+# .dockerignore remove tracked files or .git from the image build context.
+cat > "$BUILD_CONTEXT/.dockerignore" <<'DOCKERIGNORE_EOF'
+# flamp builds from a temporary clean checkout of the default branch.
+# Keep the full checkout, including .git, in the build context so the
+# Fly Machine can fetch/check out the requested branch without cloning.
+DOCKERIGNORE_EOF
+mkdir -p "$BUILD_CONTEXT/.git/info"
+{
+  echo "/$AMP_DOCKERFILE"
+  echo "/.dockerignore"
+} >> "$BUILD_CONTEXT/.git/info/exclude"
 
 # Collect any extra files/globs into a tarball to ship to the machine.
 EXTRA_TAR=""
@@ -164,11 +218,11 @@ if [[ ${#EXTRA_PATTERNS[@]} -gt 0 ]]; then
 
   if [[ ${#EXTRA_FILES[@]} -gt 0 ]]; then
     EXTRA_TAR="$(mktemp -t flamp-extras.XXXXXX).tar.gz"
-    trap 'rm -f "$EXTRA_TAR"' EXIT
+    CLEANUP_PATHS+=("$EXTRA_TAR")
     tar -czf "$EXTRA_TAR" "${EXTRA_FILES[@]}"
     EXTRA_FILE_COUNT="${#EXTRA_FILES[@]}"
     EXTRA_TAR_BYTES="$(wc -c < "$EXTRA_TAR")"
-    echo "==> Shipping $EXTRA_FILE_COUNT extra file(s) ($((EXTRA_TAR_BYTES / 1024)) KiB compressed) into the cloned repo"
+    echo "==> Shipping $EXTRA_FILE_COUNT extra file(s) ($((EXTRA_TAR_BYTES / 1024)) KiB compressed) into the repo"
     # Files are base64-embedded into the Fly machine-create request (~33% larger).
     # Fly rejects oversized request bodies, so warn before we even try.
     if [[ "$EXTRA_TAR_BYTES" -gt 4194304 ]]; then
@@ -192,19 +246,30 @@ echo "==> Setting up SSH key..."
 chmod 600 /ssh-key
 export GIT_SSH_COMMAND="ssh -i /ssh-key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-echo "==> Cloning repo and checking out branch..."
-git clone --depth=50 "$REPO_URL" "\$HOME/work"
+echo "==> Checking out branch in baked repo..."
 cd "\$HOME/work"
+if [[ ! -d .git ]]; then
+  echo "Error: Docker image does not contain a git checkout at \$HOME/work"
+  echo "       Dockerfile.amp must copy the default-branch build context into \$HOME/work, including .git."
+  exit 1
+fi
+git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL"
+mkdir -p .git/info
+{
+  echo "/$AMP_DOCKERFILE"
+  echo "/.dockerignore"
+} >> .git/info/exclude
+git reset --hard HEAD
+git ls-files --error-unmatch "$AMP_DOCKERFILE" >/dev/null 2>&1 || rm -f "$AMP_DOCKERFILE"
+git ls-files --error-unmatch .dockerignore >/dev/null 2>&1 || rm -f .dockerignore
 if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
   git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH"
-  if git show-ref --verify --quiet "refs/heads/$BRANCH"; then
-    git checkout "$BRANCH"
-    git reset --hard "origin/$BRANCH"
-  else
-    git checkout -b "$BRANCH" "origin/$BRANCH"
-  fi
+  git checkout -f -B "$BRANCH" "origin/$BRANCH"
+  git reset --hard "origin/$BRANCH"
 else
-  git checkout -b "$BRANCH"
+  git fetch origin "$DEFAULT_BRANCH":"refs/remotes/origin/$DEFAULT_BRANCH"
+  git checkout -f -B "$BRANCH" "origin/$DEFAULT_BRANCH"
+  git reset --hard "origin/$DEFAULT_BRANCH"
 fi
 
 git config user.name "amp for Vadim Liventsev"
@@ -292,8 +357,8 @@ if [[ -n "$EXTRA_TAR" ]]; then
   EXTRA_FILE_ARGS+=(--file-local "/extra-files.tar=$EXTRA_TAR")
 fi
 
-fly machine run . bash /run-amp.sh \
-  --dockerfile "$AMP_DOCKERFILE" \
+fly machine run "$BUILD_CONTEXT" bash /run-amp.sh \
+  --dockerfile "$BUILD_CONTEXT/$AMP_DOCKERFILE" \
   --app "$FLY_APP" \
   --region "$FLY_REGION" \
   --vm-size "$FLY_VM_SIZE" \

@@ -38,9 +38,9 @@ Pass `HEAD` as the branch to use your currently checked-out branch:
 ./flamp HEAD @prompt.md
 ```
 
-The Fly Machine clones from `origin`, so the branch (including `HEAD`) must already be pushed with the commits you want Amp to work from — uncommitted local changes are not picked up.
+The Docker image is built from a clean checkout of `origin`'s default branch, not your local worktree. At runtime the Fly Machine fetches and checks out the requested branch, so the branch (including `HEAD`) must already be pushed with the commits you want Amp to work from — uncommitted local changes are not picked up.
 
-Extra path or glob arguments are copied into the cloned repository on the Fly Machine at the same relative path. They are added to `.git/info/exclude` there, so they are available to Amp but are not committed.
+Extra path or glob arguments are copied into the checked-out repository on the Fly Machine at the same relative path. They are added to `.git/info/exclude` there, so they are available to Amp but are not committed.
 
 ## Configuration
 
@@ -59,13 +59,14 @@ Environment variable | Default | Description
 ## How it works
 
 1. Reads the prompt from an argument, `@file`, `-`, or stdin.
-2. Generates `Dockerfile.amp` if the repo does not already have one.
-3. Starts a disposable Fly Machine with the repo, prompt, SSH key, and optional extra files.
-4. Clones the GitHub repository, checks out or creates the requested branch, and runs Amp in deep mode.
-5. Commits any changes, pulls the latest branch state, asks Amp to resolve merge conflicts if needed, and pushes back to `origin`.
+2. Builds a Docker context from a clean checkout of `origin`'s default branch, excluding local worktree files.
+3. Generates `Dockerfile.amp` if the repo does not already have one. Generated Dockerfiles copy the default-branch checkout into `/tmp/home/work` and install project dependencies there.
+4. Starts a disposable Fly Machine with the baked-in repo, prompt, SSH key, and optional extra files.
+5. Fetches and checks out or creates the requested branch in the baked-in repo, then runs Amp in deep mode.
+6. Commits any changes, pulls the latest branch state, asks Amp to resolve merge conflicts if needed, and pushes back to `origin`.
 
 ## Notes
 
 - The Fly Machine receives the SSH key as a mounted file and uses it only for Git operations.
-- Generated or supplied `Dockerfile.amp` controls the cloud development environment.
+- Generated or supplied `Dockerfile.amp` controls the cloud development environment. It should copy the build context into `/tmp/home/work` (including `.git`) and install the project dependencies there.
 - Extra local files are intentionally excluded from commits on the remote Machine.
