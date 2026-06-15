@@ -60,7 +60,7 @@ Environment variable | Default | Description
 
 1. Reads the prompt from an argument, `@file`, `-`, or stdin.
 2. Builds a Docker context from a clean checkout of `origin`'s default branch, excluding local worktree files.
-3. Assembles the Dockerfile from a single-stage fragment, `flamp-deps.Dockerfile` (the base image + system/dependency steps, which Amp generates — reusing the repo's existing Dockerfile where possible — if the repo does not already have one). flamp injects the repo checkout (`WORKDIR /tmp/home/work` + `COPY . /tmp/home/work`, including `.git`) right after the fragment's `FROM`, then appends git/ssh/ripgrep and the Amp CLI install. Supplying your own complete `Dockerfile.amp` overrides this entirely.
+3. Assembles the Dockerfile from a single-stage fragment, `flamp-deps.Dockerfile` (the base image + system/dependency steps, which Amp generates — reusing the repo's existing Dockerfile where possible — if the repo does not already have one). flamp injects the repo worktree (`WORKDIR /tmp/home/work` + `COPY . /tmp/home/work`, **without** `.git`) right after the fragment's `FROM`, then appends git/ssh/ripgrep and the Amp CLI install. `.git` is deliberately excluded: a fresh clone's `.git` is not byte-stable, so baking it in would bust the Docker layer cache on every build (the runtime fetch recreates `.git` on the Machine). Supplying your own complete `Dockerfile.amp` overrides this entirely.
 4. Starts a disposable Fly Machine with the baked-in repo, prompt, SSH key, and optional extra files.
 5. Fetches and checks out or creates the requested branch in the baked-in repo, then runs Amp in deep mode.
 6. Commits any changes, pulls the latest branch state, asks Amp to resolve merge conflicts if needed, and pushes back to `origin`.
@@ -69,5 +69,5 @@ Environment variable | Default | Description
 
 - The Fly Machine receives the SSH key as a mounted file and uses it only for Git operations.
 - `flamp-deps.Dockerfile` is a single-stage Dockerfile fragment: its `FROM` plus the system/dependency `RUN`/`ENV` lines, ideally lifted from the repo's own Dockerfile. flamp injects the repo checkout right after the `FROM` and appends the tooling/Amp install, so the steps the runner depends on stay pinned in flamp's code rather than the agent's. It must contain exactly one `FROM`; for multi-stage or fully custom builds, use a complete `Dockerfile.amp` instead.
-- For full control over the image, commit your own `Dockerfile.amp`. When present it is built verbatim and must copy the build context into `/tmp/home/work` (including `.git`), install dependencies, and install the Amp CLI itself.
+- For full control over the image, commit your own `Dockerfile.amp`. When present it is built verbatim and must copy the build context into `/tmp/home/work`, install dependencies, and install the Amp CLI itself. The build context no longer contains `.git`; the runner initializes git at runtime, so you don't need to bake it in (if you do, the runner reuses it).
 - Extra local files are intentionally excluded from commits on the remote Machine.

@@ -165,7 +165,7 @@ Generate a single-stage Dockerfile fragment and save it as flamp-deps.Dockerfile
 
 If the repository already ships a Dockerfile (it is often production-oriented), reuse the relevant parts: the base image, system package installs, and dependency installs. Adapt them for development rather than copying blindly.
 
-flamp builds the final image from your fragment. It injects `WORKDIR /tmp/home/work` and `COPY . /tmp/home/work` (the repository checkout, including .git) immediately after your FROM line, then appends the tooling and amp CLI install at the end. So when your dependency-install instructions run, the repository is already present at the working directory.
+flamp builds the final image from your fragment. It injects `WORKDIR /tmp/home/work` and `COPY . /tmp/home/work` (the repository working tree, without .git) immediately after your FROM line, then appends the tooling and amp CLI install at the end. So when your dependency-install instructions run, the repository is already present at the working directory.
 
 The fragment must:
 - contain exactly one FROM line (single stage), choosing a base image suitable for development;
@@ -204,7 +204,7 @@ PROMPT_EOF
     { print }
     !injected && toupper($1) == "FROM" {
       print ""
-      print "# --- flamp: bake the default-branch checkout (incl .git) into the image ---"
+      print "# --- flamp: bake the default-branch worktree (no .git) into the image ---"
       print "WORKDIR /tmp/home/work"
       print "COPY . /tmp/home/work"
       print ""
@@ -238,20 +238,30 @@ git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
 # download data, or clone things. Plain `clean -fdx` skips dirs containing their
 # own .git, which is how multi-GB junk leaks into the Docker build context.
 git -C "$BUILD_CONTEXT" clean -ffdx >/dev/null
+
+# Record the default-branch tracked files before dropping .git. The runner uses
+# this list to prune files that exist on the default branch (baked into the
+# image) but not on the target branch -- without a baked .git, a runtime
+# checkout can't figure that out on its own.
+git -C "$BUILD_CONTEXT" ls-files > "$BUILD_CONTEXT/.flamp-baked-files"
+
+# Drop .git from the build context. A fresh clone's .git is NOT byte-stable
+# (pack files differ run to run even for identical repo state), so baking it
+# into `COPY . /tmp/home/work` busts the Docker layer cache on every build --
+# even when nothing changed -- which then rebuilds the expensive dependency
+# layers. The worktree alone IS byte-stable, so dropping .git lets the cache
+# actually hit. The runner re-creates .git at runtime via git init + fetch.
+rm -rf "$BUILD_CONTEXT/.git"
+
 cp "$DOCKERFILE_TO_BUILD" "$BUILD_CONTEXT/$AMP_DOCKERFILE"
 
-# The temporary checkout is already clean, so don't let the repo's own
-# .dockerignore remove tracked files or .git from the image build context.
-cat > "$BUILD_CONTEXT/.dockerignore" <<'DOCKERIGNORE_EOF'
-# flamp builds from a temporary clean checkout of the default branch.
-# Keep the full checkout, including .git, in the build context so the
-# Fly Machine can fetch/check out the requested branch without cloning.
+# Keep .git (defensive; already removed), the build recipe, and the
+# .dockerignore itself out of the image.
+cat > "$BUILD_CONTEXT/.dockerignore" <<DOCKERIGNORE_EOF
+.git
+/$AMP_DOCKERFILE
+/.dockerignore
 DOCKERIGNORE_EOF
-mkdir -p "$BUILD_CONTEXT/.git/info"
-{
-  echo "/$AMP_DOCKERFILE"
-  echo "/.dockerignore"
-} >> "$BUILD_CONTEXT/.git/info/exclude"
 
 # Collect any extra files/globs into a tarball to ship to the machine.
 EXTRA_TAR=""
@@ -302,28 +312,45 @@ export GIT_SSH_COMMAND="ssh -i /ssh-key -o StrictHostKeyChecking=no -o UserKnown
 
 echo "==> Checking out branch in baked repo..."
 cd "\$HOME/work"
+# The image bakes only the default-branch worktree, not .git (baking .git busts
+# the Docker build cache -- see flamp). Initialize a fresh repo if needed; a
+# full-override Dockerfile.amp may still bake its own .git, which we reuse.
 if [[ ! -d .git ]]; then
-  echo "Error: Docker image does not contain a git checkout at \$HOME/work"
-  echo "       Dockerfile.amp must copy the default-branch build context into \$HOME/work, including .git."
-  exit 1
+  git init -q
 fi
 git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL"
 mkdir -p .git/info
 {
   echo "/$AMP_DOCKERFILE"
   echo "/.dockerignore"
+  echo "/.flamp-baked-files"
 } >> .git/info/exclude
-git reset --hard HEAD
+# If .git was baked in (full override), reset to its HEAD first.
+if git rev-parse --verify HEAD >/dev/null 2>&1; then
+  git reset --hard HEAD
+fi
 git ls-files --error-unmatch "$AMP_DOCKERFILE" >/dev/null 2>&1 || rm -f "$AMP_DOCKERFILE"
 git ls-files --error-unmatch .dockerignore >/dev/null 2>&1 || rm -f .dockerignore
 if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
-  git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH"
-  git checkout -f -B "$BRANCH" "origin/$BRANCH"
-  git reset --hard "origin/$BRANCH"
+  git fetch --depth=50 origin "$BRANCH":"refs/remotes/origin/$BRANCH"
+  TARGET_REF="origin/$BRANCH"
 else
-  git fetch origin "$DEFAULT_BRANCH":"refs/remotes/origin/$DEFAULT_BRANCH"
-  git checkout -f -B "$BRANCH" "origin/$DEFAULT_BRANCH"
-  git reset --hard "origin/$DEFAULT_BRANCH"
+  git fetch --depth=50 origin "$DEFAULT_BRANCH":"refs/remotes/origin/$DEFAULT_BRANCH"
+  TARGET_REF="origin/$DEFAULT_BRANCH"
+fi
+git checkout -f -B "$BRANCH" "\$TARGET_REF"
+git reset --hard "\$TARGET_REF"
+
+# Without a baked .git, the checkout above cannot prune files that exist on the
+# default branch (baked into the image) but were deleted on the target branch.
+# Remove any such leftovers, while preserving build-time dependency artifacts
+# (node_modules, venvs, etc.) which were never tracked on the default branch.
+if [[ -f .flamp-baked-files ]]; then
+  while IFS= read -r baked_path; do
+    [[ -z "\$baked_path" ]] && continue
+    git ls-files --error-unmatch -- "\$baked_path" >/dev/null 2>&1 || rm -rf -- "\$baked_path"
+  done < .flamp-baked-files
+  rm -f .flamp-baked-files
 fi
 
 git config user.name "amp for Vadim Liventsev"
