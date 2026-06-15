@@ -136,10 +136,21 @@ if [[ -z "$DEFAULT_BRANCH" || "$DEFAULT_BRANCH" == "(unknown)" ]]; then
   exit 1
 fi
 
+# Pin the build context to the current local commit rather than re-fetching
+# origin's default-branch tip on every run. The baked worktree only seeds the
+# image's dependency/cache layers (the runner re-fetches the real target branch
+# at runtime), so a stable, locally-pinned context lets the Docker layer cache
+# actually hit across runs. To force a refresh of the baked deps, remove
+# Dockerfile.amp / flamp-deps.Dockerfile and re-run. Cloning from the local repo
+# (not the worktree) keeps the checkout clean of uncommitted worktree junk.
+CURRENT_COMMIT="$(git rev-parse HEAD)"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
 BUILD_CONTEXT="$(mktemp -d -t flamp-context.XXXXXX)"
 CLEANUP_PATHS+=("$BUILD_CONTEXT")
-echo "==> Preparing Docker build context from origin/$DEFAULT_BRANCH..."
-git clone --depth=50 --branch "$DEFAULT_BRANCH" --single-branch "$REMOTE_URL" "$BUILD_CONTEXT" >/dev/null
+echo "==> Preparing Docker build context pinned to commit ${CURRENT_COMMIT:0:12}..."
+git clone --quiet --no-checkout "$REPO_ROOT" "$BUILD_CONTEXT" >/dev/null
+git -C "$BUILD_CONTEXT" checkout --quiet --detach "$CURRENT_COMMIT"
 
 AMP_DOCKERFILE="Dockerfile.amp"
 FLAMP_DEPS="flamp-deps.Dockerfile"
@@ -204,7 +215,7 @@ PROMPT_EOF
     { print }
     !injected && toupper($1) == "FROM" {
       print ""
-      print "# --- flamp: bake the default-branch worktree (no .git) into the image ---"
+      print "# --- flamp: bake the pinned-commit worktree (no .git) into the image ---"
       print "WORKDIR /tmp/home/work"
       print "COPY . /tmp/home/work"
       print ""
@@ -229,9 +240,10 @@ AMPEOF
 fi
 
 # Restore the temporary checkout, then copy in the build recipe. The build
-# context should contain only origin's default branch (plus Dockerfile.amp as
-# the build recipe), never the local worktree. The dependency fragment is
-# inlined into Dockerfile.amp above, so it does not need to ship in the context.
+# context should contain only the pinned commit's tracked files (plus
+# Dockerfile.amp as the build recipe), never the local worktree. The dependency
+# fragment is inlined into Dockerfile.amp above, so it does not need to ship in
+# the context.
 git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
 # Double-force (-ff) so nested git repos are removed too: the deps-generation
 # agent runs with --dangerously-allow-all inside this dir and may create venvs,
@@ -239,10 +251,10 @@ git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
 # own .git, which is how multi-GB junk leaks into the Docker build context.
 git -C "$BUILD_CONTEXT" clean -ffdx >/dev/null
 
-# Record the default-branch tracked files before dropping .git. The runner uses
-# this list to prune files that exist on the default branch (baked into the
-# image) but not on the target branch -- without a baked .git, a runtime
-# checkout can't figure that out on its own.
+# Record the pinned commit's tracked files before dropping .git. The runner uses
+# this list to prune files that exist in the baked commit (baked into the image)
+# but not on the target branch -- without a baked .git, a runtime checkout can't
+# figure that out on its own.
 git -C "$BUILD_CONTEXT" ls-files > "$BUILD_CONTEXT/.flamp-baked-files"
 
 # Drop .git from the build context. A fresh clone's .git is NOT byte-stable
@@ -341,10 +353,10 @@ fi
 git checkout -f -B "$BRANCH" "\$TARGET_REF"
 git reset --hard "\$TARGET_REF"
 
-# Without a baked .git, the checkout above cannot prune files that exist on the
-# default branch (baked into the image) but were deleted on the target branch.
+# Without a baked .git, the checkout above cannot prune files that exist in the
+# baked commit (baked into the image) but were deleted on the target branch.
 # Remove any such leftovers, while preserving build-time dependency artifacts
-# (node_modules, venvs, etc.) which were never tracked on the default branch.
+# (node_modules, venvs, etc.) which were never tracked in the baked commit.
 if [[ -f .flamp-baked-files ]]; then
   while IFS= read -r baked_path; do
     [[ -z "\$baked_path" ]] && continue
