@@ -2,7 +2,7 @@
 
 **agentic engineering with wings**
 
-`flamp` runs an Amp prompt on a disposable Fly Machine, commits the result, and pushes it back to your GitHub branch. Launch your agent, close your laptop, get a push notification to your phone when it's done.
+`flamp` runs an [Amp](https://ampcode.com) prompt on a disposable Fly Machine, commits the result, and pushes it back to your GitHub branch. Launch your agent, close your laptop, get a push notification to your phone when it's done.
 
 ## Requirements
 
