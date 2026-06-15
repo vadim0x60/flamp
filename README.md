@@ -8,7 +8,7 @@
 
 - A Git repository with an `origin` remote, preferably on GitHub.
 - The [Fly CLI](https://fly.io/docs/flyctl/) installed and authenticated.
-- The [Amp CLI](https://ampcode.com/) installed locally. `flamp` uses it to generate `flamp-setup.sh` (the project's dependency-install script) when one does not already exist.
+- The [Amp CLI](https://ampcode.com/) installed locally. `flamp` uses it to generate `flamp-deps.Dockerfile` (the project's base image + dependency-install steps) when one does not already exist.
 - An Amp API key in `AMP_API_KEY`.
 - An SSH private key with push access to the repo in `CLOUD_SSH_KEY_PATH`.
 
@@ -60,7 +60,7 @@ Environment variable | Default | Description
 
 1. Reads the prompt from an argument, `@file`, `-`, or stdin.
 2. Builds a Docker context from a clean checkout of `origin`'s default branch, excluding local worktree files.
-3. Builds the image from a Dockerfile that flamp owns: it bakes the default-branch checkout (including `.git`) into `/tmp/home/work`, installs git/ssh/the Amp CLI, and runs `flamp-setup.sh` for project dependencies. flamp generates `flamp-setup.sh` with Amp if the repo does not already have one. Supplying your own `Dockerfile.amp` overrides this entirely.
+3. Assembles the Dockerfile from a single-stage fragment, `flamp-deps.Dockerfile` (the base image + system/dependency steps, which Amp generates — reusing the repo's existing Dockerfile where possible — if the repo does not already have one). flamp injects the repo checkout (`WORKDIR /tmp/home/work` + `COPY . /tmp/home/work`, including `.git`) right after the fragment's `FROM`, then appends git/ssh/ripgrep and the Amp CLI install. Supplying your own complete `Dockerfile.amp` overrides this entirely.
 4. Starts a disposable Fly Machine with the baked-in repo, prompt, SSH key, and optional extra files.
 5. Fetches and checks out or creates the requested branch in the baked-in repo, then runs Amp in deep mode.
 6. Commits any changes, pulls the latest branch state, asks Amp to resolve merge conflicts if needed, and pushes back to `origin`.
@@ -68,6 +68,6 @@ Environment variable | Default | Description
 ## Notes
 
 - The Fly Machine receives the SSH key as a mounted file and uses it only for Git operations.
-- `flamp-setup.sh` installs the project's system and language dependencies on top of `ubuntu:24.04`; it runs at image-build time with the repo checked out at the working directory. flamp owns the surrounding Dockerfile (baking the repo into `/tmp/home/work`, installing git/ssh/Amp), so the steps the runner depends on stay deterministic.
-- For full control over the image (custom base image, exotic runtimes), commit your own `Dockerfile.amp`. When present it is built verbatim and must copy the build context into `/tmp/home/work` (including `.git`), install dependencies, and install the Amp CLI itself.
+- `flamp-deps.Dockerfile` is a single-stage Dockerfile fragment: its `FROM` plus the system/dependency `RUN`/`ENV` lines, ideally lifted from the repo's own Dockerfile. flamp injects the repo checkout right after the `FROM` and appends the tooling/Amp install, so the steps the runner depends on stay pinned in flamp's code rather than the agent's. It must contain exactly one `FROM`; for multi-stage or fully custom builds, use a complete `Dockerfile.amp` instead.
+- For full control over the image, commit your own `Dockerfile.amp`. When present it is built verbatim and must copy the build context into `/tmp/home/work` (including `.git`), install dependencies, and install the Amp CLI itself.
 - Extra local files are intentionally excluded from commits on the remote Machine.

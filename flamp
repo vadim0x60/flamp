@@ -140,7 +140,7 @@ echo "==> Preparing Docker build context from origin/$DEFAULT_BRANCH..."
 git clone --depth=50 --branch "$DEFAULT_BRANCH" --single-branch "$REMOTE_URL" "$BUILD_CONTEXT" >/dev/null
 
 AMP_DOCKERFILE="Dockerfile.amp"
-FLAMP_SETUP="flamp-setup.sh"
+FLAMP_DEPS="flamp-deps.Dockerfile"
 
 if [[ -f "$AMP_DOCKERFILE" ]]; then
   # Full override: the user supplied their own Dockerfile.amp, so they own the
@@ -148,90 +148,91 @@ if [[ -f "$AMP_DOCKERFILE" ]]; then
   # project deps, install the amp CLI). flamp builds it verbatim.
   echo "==> Using existing $AMP_DOCKERFILE (full override)"
   DOCKERFILE_TO_BUILD="$AMP_DOCKERFILE"
-  SETUP_TO_SHIP=""
 else
-  # Default path: flamp owns the Dockerfile so the steps the runner depends on
-  # -- baking the repo into /tmp/home/work, WORKDIR, installing git/ssh/amp --
-  # are deterministic and never left to the agent. The only repo-specific part,
-  # installing dependencies, is delegated to an agent-generated flamp-setup.sh.
-  if [[ ! -f "$FLAMP_SETUP" ]]; then
-    echo "==> Generating $FLAMP_SETUP (project dependency install)..."
+  # Default path: the agent only authors a single-stage Dockerfile *fragment*
+  # (its FROM + system/dependency RUN/ENV lines, ideally lifted from the repo's
+  # own Dockerfile). flamp then assembles the real Dockerfile, injecting the
+  # repo checkout right after FROM and the tooling/amp install at the end, so
+  # the steps the runner depends on stay pinned in code rather than the agent.
+  if [[ ! -f "$FLAMP_DEPS" ]]; then
+    echo "==> Generating $FLAMP_DEPS (base image + dependency install)..."
     (
       cd "$BUILD_CONTEXT"
       cat <<'PROMPT_EOF' | amp -x -m smart --dangerously-allow-all
-Generate a shell script and save it as flamp-setup.sh in the current directory. It must install everything needed to develop this repository.
+Generate a single-stage Dockerfile fragment and save it as flamp-deps.Dockerfile in the current directory. It sets up the environment needed to develop this repository.
 
-Context: flamp builds a Docker image FROM ubuntu:24.04 (Debian/apt based) with this repository already checked out at the working directory, then runs your script as root with `bash flamp-setup.sh` from that directory.
+If the repository already ships a Dockerfile (it is often production-oriented), reuse the relevant parts: the base image, system package installs, and dependency installs. Adapt them for development rather than copying blindly.
 
-The script must:
-- begin with `#!/bin/bash` and `set -o errexit -o pipefail`;
-- be non-interactive (export DEBIAN_FRONTEND=noninteractive and run `apt-get update` before installing);
-- install via apt-get any language runtimes, compilers, and system libraries the project needs (e.g. python3 + python3-venv, nodejs/npm, build-essential), because the base image is minimal ubuntu;
-- install all project dependencies from the repository's setup files (pip install -r requirements*.txt, pip install -e ., npm/pnpm/yarn install, make install-deps, or the repo's documented equivalent), run from the current directory.
+flamp builds the final image from your fragment. It injects `WORKDIR /tmp/home/work` and `COPY . /tmp/home/work` (the repository checkout, including .git) immediately after your FROM line, then appends the tooling and amp CLI install at the end. So when your dependency-install instructions run, the repository is already present at the working directory.
 
-The script must NOT clone the repository, run tests, configure git, or install the amp CLI -- flamp already handles those.
+The fragment must:
+- contain exactly one FROM line (single stage), choosing a base image suitable for development;
+- install any system packages, language runtimes, and compilers the project needs (using the base image's package manager);
+- install all project dependencies from the repository's setup files (pip install -r requirements*.txt, pip install -e ., npm/pnpm/yarn install, make install-deps, or the repo's documented equivalent).
+
+The fragment must NOT include COPY of the source, WORKDIR, CMD/ENTRYPOINT, git configuration, test runs, or the amp CLI install -- flamp handles all of those.
 PROMPT_EOF
     )
 
-    if [[ ! -s "$BUILD_CONTEXT/$FLAMP_SETUP" ]]; then
-      echo "Error: failed to generate $FLAMP_SETUP"
+    if [[ ! -s "$BUILD_CONTEXT/$FLAMP_DEPS" ]]; then
+      echo "Error: failed to generate $FLAMP_DEPS"
       exit 1
     fi
 
-    cp "$BUILD_CONTEXT/$FLAMP_SETUP" "$FLAMP_SETUP"
+    cp "$BUILD_CONTEXT/$FLAMP_DEPS" "$FLAMP_DEPS"
   else
-    echo "==> Using existing $FLAMP_SETUP"
+    echo "==> Using existing $FLAMP_DEPS"
   fi
 
-  # Assemble the deterministic Dockerfile into a temp file. It is never written
-  # back to the repo, so improvements to flamp's scaffolding always take effect
-  # and it is never mistaken for a user-supplied override on the next run.
+  # The fragment must be single-stage so the injected checkout lands in the one
+  # image the agent runs in. Reject anything else and point at the override.
+  FROM_COUNT="$(grep -ciE '^[[:space:]]*from[[:space:]]' "$FLAMP_DEPS" || true)"
+  if [[ "$FROM_COUNT" -ne 1 ]]; then
+    echo "Error: $FLAMP_DEPS must contain exactly one FROM line (single stage); found $FROM_COUNT."
+    echo "       For multi-stage or fully custom builds, provide a complete $AMP_DOCKERFILE instead."
+    exit 1
+  fi
+
+  # Assemble the Dockerfile into a temp file (never written back to the repo, so
+  # flamp's scaffolding always takes effect and the fragment is never mistaken
+  # for a full override). Inject the checkout right after the agent's FROM...
   DOCKERFILE_TO_BUILD="$(mktemp -t flamp-dockerfile.XXXXXX)"
   CLEANUP_PATHS+=("$DOCKERFILE_TO_BUILD")
-  cat > "$DOCKERFILE_TO_BUILD" <<'DOCKEREOF'
-# syntax=docker/dockerfile:1.6
-# flamp-managed development image. Everything here is fixed by flamp except
-# flamp-setup.sh (generated by amp), which installs the repo's dependencies.
-FROM ubuntu:24.04
+  awk '
+    { print }
+    !injected && toupper($1) == "FROM" {
+      print ""
+      print "# --- flamp: bake the default-branch checkout (incl .git) into the image ---"
+      print "WORKDIR /tmp/home/work"
+      print "COPY . /tmp/home/work"
+      print ""
+      injected = 1
+    }
+  ' "$FLAMP_DEPS" > "$DOCKERFILE_TO_BUILD"
 
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1
+  # ...then append the tooling the runner needs and the amp CLI. The base image
+  # is the agent's choice, so detect the package manager at build time.
+  cat >> "$DOCKERFILE_TO_BUILD" <<'AMPEOF'
 
-# Tooling the flamp runner needs regardless of the project: git/ssh for the
-# push, curl for the amp install, ripgrep because the agent loves it.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        openssh-client \
-        ripgrep \
-    && rm -rf /var/lib/apt/lists/*
+# --- flamp: tooling the runner needs (git/ssh for push, curl, ripgrep) ---
+RUN (apk add --no-cache ca-certificates curl git openssh-client ripgrep || \
+     (apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client ripgrep && rm -rf /var/lib/apt/lists/*) || \
+     dnf install -y ca-certificates curl git openssh-clients ripgrep || \
+     echo "tooling not installed, skipping...") || true
 
-WORKDIR /tmp/home/work
-
-# Bake the default-branch checkout (including .git) into the image so the Fly
-# Machine can fetch/check out the requested branch without cloning.
-COPY . /tmp/home/work
-
-# Repo-specific system + project dependency installation.
-RUN bash flamp-setup.sh
-
-# Install amp CLI
+# --- flamp: install amp CLI ---
 RUN curl -fsSL https://ampcode.com/install.sh | bash
 ENV PATH="/root/.amp/bin:${PATH}"
-DOCKEREOF
-  SETUP_TO_SHIP="$FLAMP_SETUP"
+AMPEOF
 fi
 
 # Restore the temporary checkout, then copy in the build recipe. The build
-# context should contain only origin's default branch (plus Dockerfile.amp and,
-# in the default path, flamp-setup.sh), never the local worktree.
+# context should contain only origin's default branch (plus Dockerfile.amp as
+# the build recipe), never the local worktree. The dependency fragment is
+# inlined into Dockerfile.amp above, so it does not need to ship in the context.
 git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
 git -C "$BUILD_CONTEXT" clean -fdx >/dev/null
 cp "$DOCKERFILE_TO_BUILD" "$BUILD_CONTEXT/$AMP_DOCKERFILE"
-if [[ -n "$SETUP_TO_SHIP" ]]; then
-  cp "$SETUP_TO_SHIP" "$BUILD_CONTEXT/$FLAMP_SETUP"
-fi
 
 # The temporary checkout is already clean, so don't let the repo's own
 # .dockerignore remove tracked files or .git from the image build context.
@@ -244,7 +245,6 @@ mkdir -p "$BUILD_CONTEXT/.git/info"
 {
   echo "/$AMP_DOCKERFILE"
   echo "/.dockerignore"
-  if [[ -n "$SETUP_TO_SHIP" ]]; then echo "/$FLAMP_SETUP"; fi
 } >> "$BUILD_CONTEXT/.git/info/exclude"
 
 # Collect any extra files/globs into a tarball to ship to the machine.
@@ -306,12 +306,10 @@ mkdir -p .git/info
 {
   echo "/$AMP_DOCKERFILE"
   echo "/.dockerignore"
-  echo "/$FLAMP_SETUP"
 } >> .git/info/exclude
 git reset --hard HEAD
 git ls-files --error-unmatch "$AMP_DOCKERFILE" >/dev/null 2>&1 || rm -f "$AMP_DOCKERFILE"
 git ls-files --error-unmatch .dockerignore >/dev/null 2>&1 || rm -f .dockerignore
-git ls-files --error-unmatch "$FLAMP_SETUP" >/dev/null 2>&1 || rm -f "$FLAMP_SETUP"
 if git ls-remote --exit-code --heads origin "$BRANCH" > /dev/null 2>&1; then
   git fetch origin "$BRANCH":"refs/remotes/origin/$BRANCH"
   git checkout -f -B "$BRANCH" "origin/$BRANCH"
