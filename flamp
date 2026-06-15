@@ -114,7 +114,9 @@ if [[ ! -f "$CLOUD_SSH_KEY_PATH" ]]; then
   exit 1
 fi
 
-SSH_KEY_PATH="$CLOUD_SSH_KEY_PATH"
+# Resolve to an absolute path: the fly build below runs from inside
+# $BUILD_CONTEXT (see the launch step), so a relative key path would break.
+SSH_KEY_PATH="$(cd "$(dirname "$CLOUD_SSH_KEY_PATH")" && pwd)/$(basename "$CLOUD_SSH_KEY_PATH")"
 
 CLEANUP_PATHS=()
 cleanup() {
@@ -231,7 +233,11 @@ fi
 # the build recipe), never the local worktree. The dependency fragment is
 # inlined into Dockerfile.amp above, so it does not need to ship in the context.
 git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
-git -C "$BUILD_CONTEXT" clean -fdx >/dev/null
+# Double-force (-ff) so nested git repos are removed too: the deps-generation
+# agent runs with --dangerously-allow-all inside this dir and may create venvs,
+# download data, or clone things. Plain `clean -fdx` skips dirs containing their
+# own .git, which is how multi-GB junk leaks into the Docker build context.
+git -C "$BUILD_CONTEXT" clean -ffdx >/dev/null
 cp "$DOCKERFILE_TO_BUILD" "$BUILD_CONTEXT/$AMP_DOCKERFILE"
 
 # The temporary checkout is already clean, so don't let the repo's own
@@ -405,20 +411,29 @@ if [[ -n "$EXTRA_TAR" ]]; then
   EXTRA_FILE_ARGS+=(--file-local "/extra-files.tar=$EXTRA_TAR")
 fi
 
-fly machine run "$BUILD_CONTEXT" bash /run-amp.sh \
-  --dockerfile "$BUILD_CONTEXT/$AMP_DOCKERFILE" \
-  --app "$FLY_APP" \
-  --region "$FLY_REGION" \
-  --vm-size "$FLY_VM_SIZE" \
-  --vm-memory "$FLY_VM_MEMORY" \
-  --env "AMP_API_KEY=$AMP_API_KEY" \
-  --env "FLAMP_SIMPLEPUSH_KEY=${FLAMP_SIMPLEPUSH_KEY:-}" \
-  --env "DEBIAN_FRONTEND=noninteractive" \
-  --restart no \
-  --rm \
-  --file-literal /run-amp.sh="$RUNNER_SCRIPT" \
-  --file-literal /prompt.txt="$PROMPT" \
-  --file-local /ssh-key="$SSH_KEY_PATH" \
-  ${EXTRA_FILE_ARGS[@]+"${EXTRA_FILE_ARGS[@]}"}
+# IMPORTANT: `fly machine run` has no build-context positional (unlike
+# `fly deploy`, whose first arg is the context). When building via --dockerfile
+# it uses the *current working directory* as the Docker build context. So we run
+# it from inside the clean checkout; otherwise fly tars up wherever the user
+# invoked flamp from -- typically their repo worktree with multi-GB
+# node_modules/.venv/build dirs -- and ships all of it to the builder.
+(
+  cd "$BUILD_CONTEXT"
+  fly machine run "$BUILD_CONTEXT" bash /run-amp.sh \
+    --dockerfile "$BUILD_CONTEXT/$AMP_DOCKERFILE" \
+    --app "$FLY_APP" \
+    --region "$FLY_REGION" \
+    --vm-size "$FLY_VM_SIZE" \
+    --vm-memory "$FLY_VM_MEMORY" \
+    --env "AMP_API_KEY=$AMP_API_KEY" \
+    --env "FLAMP_SIMPLEPUSH_KEY=${FLAMP_SIMPLEPUSH_KEY:-}" \
+    --env "DEBIAN_FRONTEND=noninteractive" \
+    --restart no \
+    --rm \
+    --file-literal /run-amp.sh="$RUNNER_SCRIPT" \
+    --file-literal /prompt.txt="$PROMPT" \
+    --file-local /ssh-key="$SSH_KEY_PATH" \
+    ${EXTRA_FILE_ARGS[@]+"${EXTRA_FILE_ARGS[@]}"}
+)
 
 echo "==> Done."
