@@ -216,10 +216,10 @@ PROMPT_EOF
   # is the agent's choice, so detect the package manager at build time.
   cat >> "$DOCKERFILE_TO_BUILD" <<'AMPEOF'
 
-# --- flamp: tooling the runner needs (git/ssh for push, curl, ripgrep) ---
-RUN (apk add --no-cache ca-certificates curl git openssh-client ripgrep || \
-     (apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git openssh-client ripgrep && rm -rf /var/lib/apt/lists/*) || \
-     dnf install -y ca-certificates curl git openssh-clients ripgrep || \
+# --- flamp: tooling the runner needs (git/ssh for push, curl, ripgrep, git-lfs) ---
+RUN (apk add --no-cache ca-certificates curl git git-lfs openssh-client ripgrep || \
+     (apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git git-lfs openssh-client ripgrep && rm -rf /var/lib/apt/lists/*) || \
+     dnf install -y ca-certificates curl git git-lfs openssh-clients ripgrep || \
      echo "tooling not installed, skipping...") || true
 
 # --- flamp: install amp CLI ---
