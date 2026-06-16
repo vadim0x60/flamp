@@ -136,24 +136,55 @@ if [[ -z "$DEFAULT_BRANCH" || "$DEFAULT_BRANCH" == "(unknown)" ]]; then
   exit 1
 fi
 
-# Pin the build context to the current local commit rather than re-fetching
-# origin's default-branch tip on every run. The baked worktree only seeds the
-# image's dependency/cache layers (the runner re-fetches the real target branch
-# at runtime), so a stable, locally-pinned context lets the Docker layer cache
-# actually hit across runs. To force a refresh of the baked deps, remove
-# Dockerfile.amp / flamp-deps.Dockerfile and re-run. Cloning from the local repo
-# (not the worktree) keeps the checkout clean of uncommitted worktree junk.
-CURRENT_COMMIT="$(git rev-parse HEAD)"
+AMP_DOCKERFILE="Dockerfile.amp"
+FLAMP_DEPS="flamp-deps.Dockerfile"
+FLAMP_PIN="flamp-deps.commit"
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+HEAD_COMMIT="$(git rev-parse HEAD)"
+
+# Pin the build context to a *sticky* commit recorded in $FLAMP_PIN rather than
+# to whatever HEAD happens to be this run. The baked worktree only seeds the
+# image's dependency/cache layers (the runner re-fetches the real target branch
+# at runtime), so the source baked in does not need to be current -- and keeping
+# the pin sticky means ordinary local commits no longer change the build context
+# and therefore no longer bust Docker's dependency-layer cache. The pin only
+# moves when we (re)generate the dependency recipe or when you ask it to:
+#
+#   * first run / no pin yet            -> pin to HEAD
+#   * (re)generating flamp-deps.Dockerfile (it is absent) -> re-pin to HEAD,
+#     so a freshly generated recipe is built against current source
+#   * otherwise                         -> reuse the recorded sticky pin
+#
+# To force a full refresh of the baked deps, delete flamp-deps.Dockerfile (and,
+# for full-override builds, Dockerfile.amp); to rebuild deps against current
+# source without changing the recipe, delete flamp-deps.commit. Cloning from the
+# local repo (not the worktree) keeps the checkout clean of uncommitted junk.
+
+# Mirrors the generation condition below: the deps fragment is (re)generated
+# only when neither a full-override Dockerfile.amp nor the fragment exists.
+WILL_GENERATE_DEPS=false
+if [[ ! -f "$AMP_DOCKERFILE" && ! -f "$FLAMP_DEPS" ]]; then
+  WILL_GENERATE_DEPS=true
+fi
+
+if [[ -f "$FLAMP_PIN" && "$WILL_GENERATE_DEPS" == false ]]; then
+  PINNED_COMMIT="$(tr -d '[:space:]' < "$FLAMP_PIN")"
+  if [[ -z "$PINNED_COMMIT" ]] || ! git cat-file -e "${PINNED_COMMIT}^{commit}" 2>/dev/null; then
+    echo "==> Pin in $FLAMP_PIN is empty or not a known commit; re-pinning to HEAD"
+    PINNED_COMMIT="$HEAD_COMMIT"
+    echo "$PINNED_COMMIT" > "$FLAMP_PIN"
+  fi
+else
+  PINNED_COMMIT="$HEAD_COMMIT"
+  echo "$PINNED_COMMIT" > "$FLAMP_PIN"
+fi
 
 BUILD_CONTEXT="$(mktemp -d -t flamp-context.XXXXXX)"
 CLEANUP_PATHS+=("$BUILD_CONTEXT")
-echo "==> Preparing Docker build context pinned to commit ${CURRENT_COMMIT:0:12}..."
+echo "==> Preparing Docker build context pinned to commit ${PINNED_COMMIT:0:12}..."
 git clone --quiet --no-checkout "$REPO_ROOT" "$BUILD_CONTEXT" >/dev/null
-git -C "$BUILD_CONTEXT" checkout --quiet --detach "$CURRENT_COMMIT"
-
-AMP_DOCKERFILE="Dockerfile.amp"
-FLAMP_DEPS="flamp-deps.Dockerfile"
+git -C "$BUILD_CONTEXT" checkout --quiet --detach "$PINNED_COMMIT"
 
 if [[ -f "$AMP_DOCKERFILE" ]]; then
   # Full override: the user supplied their own Dockerfile.amp, so they own the
