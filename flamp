@@ -137,7 +137,6 @@ if [[ -z "$DEFAULT_BRANCH" || "$DEFAULT_BRANCH" == "(unknown)" ]]; then
 fi
 
 AMP_DOCKERFILE="Dockerfile.amp"
-FLAMP_DEPS="flamp-deps.Dockerfile"
 FLAMP_PIN="flamp-deps.commit"
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
@@ -149,22 +148,22 @@ HEAD_COMMIT="$(git rev-parse HEAD)"
 # at runtime), so the source baked in does not need to be current -- and keeping
 # the pin sticky means ordinary local commits no longer change the build context
 # and therefore no longer bust Docker's dependency-layer cache. The pin only
-# moves when we (re)generate the dependency recipe or when you ask it to:
+# moves when we (re)generate the build recipe or when you ask it to:
 #
-#   * first run / no pin yet            -> pin to HEAD
-#   * (re)generating flamp-deps.Dockerfile (it is absent) -> re-pin to HEAD,
-#     so a freshly generated recipe is built against current source
-#   * otherwise                         -> reuse the recorded sticky pin
+#   * first run / no pin yet              -> pin to HEAD
+#   * (re)generating Dockerfile.amp (it is absent) -> re-pin to HEAD, so a
+#     freshly generated recipe is built against current source
+#   * otherwise                           -> reuse the recorded sticky pin
 #
-# To force a full refresh of the baked deps, delete flamp-deps.Dockerfile (and,
-# for full-override builds, Dockerfile.amp); to rebuild deps against current
-# source without changing the recipe, delete flamp-deps.commit. Cloning from the
-# local repo (not the worktree) keeps the checkout clean of uncommitted junk.
+# To force a full refresh (new deps recipe + scaffolding), delete Dockerfile.amp;
+# to rebuild deps against current source without changing the recipe, delete
+# flamp-deps.commit. Cloning from the local repo (not the worktree) keeps the
+# checkout clean of uncommitted junk.
 
-# Mirrors the generation condition below: the deps fragment is (re)generated
-# only when neither a full-override Dockerfile.amp nor the fragment exists.
+# Mirrors the generation condition below: flamp (re)generates Dockerfile.amp
+# only when it is absent.
 WILL_GENERATE_DEPS=false
-if [[ ! -f "$AMP_DOCKERFILE" && ! -f "$FLAMP_DEPS" ]]; then
+if [[ ! -f "$AMP_DOCKERFILE" ]]; then
   WILL_GENERATE_DEPS=true
 fi
 
@@ -187,22 +186,33 @@ git clone --quiet --no-checkout "$REPO_ROOT" "$BUILD_CONTEXT" >/dev/null
 git -C "$BUILD_CONTEXT" checkout --quiet --detach "$PINNED_COMMIT"
 
 if [[ -f "$AMP_DOCKERFILE" ]]; then
-  # Full override: the user supplied their own Dockerfile.amp, so they own the
-  # whole contract (bake the repo into /tmp/home/work including .git, install
-  # project deps, install the amp CLI). flamp builds it verbatim.
-  echo "==> Using existing $AMP_DOCKERFILE (full override)"
+  # Dockerfile.amp already exists -- either flamp generated it on an earlier run
+  # or you wrote it by hand. Either way it is the complete build recipe and flamp
+  # builds it verbatim. flamp never overwrites it; delete it to regenerate.
+  if head -n 1 "$AMP_DOCKERFILE" | grep -qi flamp; then
+    echo "==> Using existing $AMP_DOCKERFILE (flamp-generated; delete to regenerate)"
+  else
+    echo "==> Using existing $AMP_DOCKERFILE (hand-written; flamp builds it verbatim)"
+  fi
   DOCKERFILE_TO_BUILD="$AMP_DOCKERFILE"
 else
-  # Default path: the agent only authors a single-stage Dockerfile *fragment*
-  # (its FROM + system/dependency RUN/ENV lines, ideally lifted from the repo's
-  # own Dockerfile). flamp then assembles the real Dockerfile, injecting the
-  # repo checkout right after FROM and the tooling/amp install at the end, so
-  # the steps the runner depends on stay pinned in code rather than the agent.
-  if [[ ! -f "$FLAMP_DEPS" ]]; then
-    echo "==> Generating $FLAMP_DEPS (base image + dependency install)..."
-    (
-      cd "$BUILD_CONTEXT"
-      cat <<'PROMPT_EOF' | amp -x -m smart --dangerously-allow-all
+  # No Dockerfile.amp yet. The agent authors a single-stage *fragment* (its FROM
+  # + system/dependency RUN/ENV lines, ideally lifted from the repo's own
+  # Dockerfile) as a transient intermediate. flamp then assembles the real
+  # Dockerfile -- injecting the repo checkout right after FROM and the tooling/amp
+  # install at the end -- and persists the assembled result as Dockerfile.amp.
+  # Only the fragment-producing step needs the LLM; persisting the assembled
+  # output (rather than the fragment) means there is a single stored artifact
+  # that is exactly what gets built. The scaffolding is therefore frozen into
+  # the file: if flamp's scaffolding ever changes, delete Dockerfile.amp to
+  # regenerate.
+  FRAGMENT="$(mktemp -t flamp-deps.XXXXXX)"
+  CLEANUP_PATHS+=("$FRAGMENT")
+
+  echo "==> Generating $AMP_DOCKERFILE (base image + dependency install)..."
+  (
+    cd "$BUILD_CONTEXT"
+    cat <<'PROMPT_EOF' | amp -x -m smart --dangerously-allow-all
 Generate a single-stage Dockerfile fragment and save it as flamp-deps.Dockerfile in the current directory. It sets up the environment needed to develop this repository.
 
 If the repository already ships a Dockerfile (it is often production-oriented), reuse the relevant parts: the base image, system package installs, and dependency installs. Adapt them for development rather than copying blindly.
@@ -216,32 +226,34 @@ The fragment must:
 
 The fragment must NOT include COPY of the source, WORKDIR, CMD/ENTRYPOINT, git configuration, test runs, or the amp CLI install -- flamp handles all of those.
 PROMPT_EOF
-    )
+  )
 
-    if [[ ! -s "$BUILD_CONTEXT/$FLAMP_DEPS" ]]; then
-      echo "Error: failed to generate $FLAMP_DEPS"
-      exit 1
-    fi
-
-    cp "$BUILD_CONTEXT/$FLAMP_DEPS" "$FLAMP_DEPS"
-  else
-    echo "==> Using existing $FLAMP_DEPS"
+  if [[ ! -s "$BUILD_CONTEXT/flamp-deps.Dockerfile" ]]; then
+    echo "Error: failed to generate the dependency fragment"
+    exit 1
   fi
+  cp "$BUILD_CONTEXT/flamp-deps.Dockerfile" "$FRAGMENT"
+  rm -f "$BUILD_CONTEXT/flamp-deps.Dockerfile"
 
   # The fragment must be single-stage so the injected checkout lands in the one
   # image the agent runs in. Reject anything else and point at the override.
-  FROM_COUNT="$(grep -ciE '^[[:space:]]*from[[:space:]]' "$FLAMP_DEPS" || true)"
+  FROM_COUNT="$(grep -ciE '^[[:space:]]*from[[:space:]]' "$FRAGMENT" || true)"
   if [[ "$FROM_COUNT" -ne 1 ]]; then
-    echo "Error: $FLAMP_DEPS must contain exactly one FROM line (single stage); found $FROM_COUNT."
-    echo "       For multi-stage or fully custom builds, provide a complete $AMP_DOCKERFILE instead."
+    echo "Error: the generated fragment must contain exactly one FROM line (single stage); found $FROM_COUNT."
+    echo "       For multi-stage or fully custom builds, write a complete $AMP_DOCKERFILE by hand instead."
     exit 1
   fi
 
-  # Assemble the Dockerfile into a temp file (never written back to the repo, so
-  # flamp's scaffolding always takes effect and the fragment is never mistaken
-  # for a full override). Inject the checkout right after the agent's FROM...
-  DOCKERFILE_TO_BUILD="$(mktemp -t flamp-dockerfile.XXXXXX)"
-  CLEANUP_PATHS+=("$DOCKERFILE_TO_BUILD")
+  # Assemble into Dockerfile.amp. The header marks it flamp-generated (see the
+  # head -n1 check above) so it is clearly safe to delete and regenerate.
+  cat > "$AMP_DOCKERFILE" <<'HEADEREOF'
+# Generated by flamp -- safe to delete to regenerate (deps recipe + scaffolding).
+# The FROM + dependency lines came from an LLM reading this repo; everything
+# marked "flamp:" is scaffolding the runner depends on. Edit by hand only if you
+# want to own the whole recipe -- flamp will not overwrite an existing file.
+HEADEREOF
+
+  # Inject the checkout right after the agent's FROM...
   awk '
     { print }
     !injected && toupper($1) == "FROM" {
@@ -252,11 +264,11 @@ PROMPT_EOF
       print ""
       injected = 1
     }
-  ' "$FLAMP_DEPS" > "$DOCKERFILE_TO_BUILD"
+  ' "$FRAGMENT" >> "$AMP_DOCKERFILE"
 
   # ...then append the tooling the runner needs and the amp CLI. The base image
   # is the agent's choice, so detect the package manager at build time.
-  cat >> "$DOCKERFILE_TO_BUILD" <<'AMPEOF'
+  cat >> "$AMP_DOCKERFILE" <<'AMPEOF'
 
 # --- flamp: tooling the runner needs (git/ssh for push, curl, ripgrep, git-lfs) ---
 RUN (apk add --no-cache ca-certificates curl git git-lfs openssh-client ripgrep || \
@@ -268,13 +280,15 @@ RUN (apk add --no-cache ca-certificates curl git git-lfs openssh-client ripgrep 
 RUN curl -fsSL https://ampcode.com/install.sh | bash
 ENV PATH="/root/.amp/bin:${PATH}"
 AMPEOF
+
+  DOCKERFILE_TO_BUILD="$AMP_DOCKERFILE"
 fi
 
 # Restore the temporary checkout, then copy in the build recipe. The build
 # context should contain only the pinned commit's tracked files (plus
 # Dockerfile.amp as the build recipe), never the local worktree. The dependency
-# fragment is inlined into Dockerfile.amp above, so it does not need to ship in
-# the context.
+# fragment was assembled into Dockerfile.amp above and the fragment itself is
+# transient, so nothing extra needs to ship in the context.
 git -C "$BUILD_CONTEXT" reset --hard HEAD >/dev/null
 # Double-force (-ff) so nested git repos are removed too: the deps-generation
 # agent runs with --dangerously-allow-all inside this dir and may create venvs,
