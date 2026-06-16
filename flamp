@@ -139,6 +139,24 @@ fi
 AMP_DOCKERFILE="Dockerfile.amp"
 FLAMP_PIN="flamp-deps.commit"
 
+# The scaffolding flamp wraps around the LLM-authored fragment. Defined once and
+# reused in three places: injected into Dockerfile.amp during assembly, and
+# quoted verbatim into the generation prompt so the agent knows exactly what
+# flamp adds (and therefore what it must not duplicate). Single source of truth.
+FLAMP_CHECKOUT_SCAFFOLD='# --- flamp: bake the pinned-commit worktree (no .git) into the image ---
+WORKDIR /tmp/home/work
+COPY . /tmp/home/work'
+
+FLAMP_TOOLING_SCAFFOLD='# --- flamp: tooling the runner needs (git/ssh for push, curl, ripgrep, git-lfs) ---
+RUN (apk add --no-cache ca-certificates curl git git-lfs openssh-client ripgrep || \
+     (apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git git-lfs openssh-client ripgrep && rm -rf /var/lib/apt/lists/*) || \
+     dnf install -y ca-certificates curl git git-lfs openssh-clients ripgrep || \
+     echo "tooling not installed, skipping...") || true
+
+# --- flamp: install amp CLI ---
+RUN curl -fsSL https://ampcode.com/install.sh | bash
+ENV PATH="/root/.amp/bin:${PATH}"'
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 HEAD_COMMIT="$(git rev-parse HEAD)"
 
@@ -208,12 +226,20 @@ else
   echo "==> Generating $AMP_DOCKERFILE (base image + dependency install)..."
   (
     cd "$BUILD_CONTEXT"
-    cat <<'PROMPT_EOF' | amp -x -m smart --dangerously-allow-all
+    cat <<PROMPT_EOF | amp -x -m smart --dangerously-allow-all
 Generate a single-stage Dockerfile fragment and save it as flamp-deps.Dockerfile in the current directory. It sets up the environment needed to develop this repository.
 
 If the repository already ships a Dockerfile (it is often production-oriented), reuse the relevant parts: the base image, system package installs, and dependency installs. Adapt them for development rather than copying blindly.
 
-flamp builds the final image from your fragment. It injects `WORKDIR /tmp/home/work` and `COPY . /tmp/home/work` (the repository working tree, without .git) immediately after your FROM line, then appends the tooling and amp CLI install at the end. So when your dependency-install instructions run, the repository is already present at the working directory.
+flamp builds the final image from your fragment. It wraps your fragment with fixed scaffolding, so write only the lines between them. Immediately after your FROM line it injects, verbatim:
+
+$FLAMP_CHECKOUT_SCAFFOLD
+
+and at the end it appends, verbatim:
+
+$FLAMP_TOOLING_SCAFFOLD
+
+So when your dependency-install instructions run, the repository is already present at the working directory, and you do not need to install git, ssh, curl, ripgrep, git-lfs, or the amp CLI yourself.
 
 The fragment must:
 - contain exactly one FROM line (single stage), choosing a base image suitable for development;
@@ -250,14 +276,13 @@ PROMPT_EOF
 # want to own the whole recipe -- flamp will not overwrite an existing file.
 HEADEREOF
 
-  # Inject the checkout right after the agent's FROM...
-  awk '
+  # Inject the checkout right after the agent's FROM... (passed via the
+  # environment so awk reproduces it literally, no escape mangling).
+  FLAMP_CHECKOUT_SCAFFOLD="$FLAMP_CHECKOUT_SCAFFOLD" awk '
     { print }
     !injected && toupper($1) == "FROM" {
       print ""
-      print "# --- flamp: bake the pinned-commit worktree (no .git) into the image ---"
-      print "WORKDIR /tmp/home/work"
-      print "COPY . /tmp/home/work"
+      print ENVIRON["FLAMP_CHECKOUT_SCAFFOLD"]
       print ""
       injected = 1
     }
@@ -265,18 +290,7 @@ HEADEREOF
 
   # ...then append the tooling the runner needs and the amp CLI. The base image
   # is the agent's choice, so detect the package manager at build time.
-  cat >> "$AMP_DOCKERFILE" <<'AMPEOF'
-
-# --- flamp: tooling the runner needs (git/ssh for push, curl, ripgrep, git-lfs) ---
-RUN (apk add --no-cache ca-certificates curl git git-lfs openssh-client ripgrep || \
-     (apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git git-lfs openssh-client ripgrep && rm -rf /var/lib/apt/lists/*) || \
-     dnf install -y ca-certificates curl git git-lfs openssh-clients ripgrep || \
-     echo "tooling not installed, skipping...") || true
-
-# --- flamp: install amp CLI ---
-RUN curl -fsSL https://ampcode.com/install.sh | bash
-ENV PATH="/root/.amp/bin:${PATH}"
-AMPEOF
+  printf '\n%s\n' "$FLAMP_TOOLING_SCAFFOLD" >> "$AMP_DOCKERFILE"
 
   DOCKERFILE_TO_BUILD="$AMP_DOCKERFILE"
 fi
