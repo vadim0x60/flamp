@@ -342,6 +342,42 @@ cat > "$BUILD_CONTEXT/.dockerignore" <<DOCKERIGNORE_EOF
 /.dockerignore
 DOCKERIGNORE_EOF
 
+# --- flamp: hand the builder a STABLE context so Fly's native cache works ---
+# Fly's remote builder already caches Docker layers out of the box (every step
+# shows CACHED). BuildKit can *also* skip re-uploading the build context -- but
+# only when the client presents the same context PATH with unchanged per-file
+# METADATA (mtime/size) between runs. flamp was defeating both: it assembled the
+# context in a brand-new `mktemp` dir each run, and `git checkout`/`clone` stamps
+# every file with a fresh mtime. BuildKit therefore saw "everything changed" and
+# re-uploaded the whole context ("transferring context: <hundreds of MB>") on
+# every single run -- only to find, after the upload, that the COPY checksum
+# matched and the layer was CACHED anyway. (A stable path alone is not enough,
+# and a symlink does not help: the underlying files still carry fresh mtimes.)
+#
+# Fix: mirror the freshly-assembled context into a fixed per-repo cache dir with
+# a checksum-based rsync. Unchanged files are skipped (rsync -c compares content,
+# not mtime) so they keep their old mtime, and the path is constant across runs.
+# BuildKit then re-uploads only the files that genuinely changed.
+if command -v rsync >/dev/null 2>&1; then
+  REPO_ID="$(printf '%s' "$REPO_ROOT" | git hash-object --stdin)"
+  STABLE_CONTEXT="${XDG_CACHE_HOME:-$HOME/.cache}/flamp/$REPO_ID"
+  mkdir -p "$STABLE_CONTEXT"
+  # --checksum: decide what to copy by content, not mtime, so a fresh `git
+  #   checkout` (which rewrites every mtime) does not look like a change.
+  # --no-times: critically, do NOT copy the source's (freshly stamped) mtimes
+  #   onto unchanged destination files -- `-a` implies `-t`, which would push the
+  #   new mtimes through and re-trigger the full upload. With --no-times an
+  #   unchanged file keeps the destination's old mtime, and a changed file simply
+  #   gets the current time (so BuildKit re-uploads exactly the changed files).
+  # --delete: keep the stable dir an exact mirror (prune files dropped from the
+  #   pinned commit) so stale content never leaks into the image.
+  rsync -a --checksum --no-times --delete "$BUILD_CONTEXT/" "$STABLE_CONTEXT/"
+  BUILD_CONTEXT="$STABLE_CONTEXT"
+  echo "==> Build context mirrored to stable path; Fly re-uploads only changed files"
+else
+  echo "==> rsync not found; using a fresh context dir (Fly will re-upload the full context every run)"
+fi
+
 # Collect any extra files/globs into a tarball to ship to the machine.
 EXTRA_TAR=""
 EXTRA_FILE_COUNT=0
