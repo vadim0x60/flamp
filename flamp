@@ -463,6 +463,11 @@ echo "Thread: \$THREAD_ID"
 if [[ -n "\${FLAMP_SIMPLEPUSH_KEY:-}" ]]; then
   echo "==> Sending amp's return message to Simplepush..."
   SIMPLEPUSH_MESSAGE=/tmp/simplepush-message.txt
+  if [[ -n "\$THREAD_ID" ]]; then
+    THREAD_LINE="https://ampcode.com/threads/\$THREAD_ID"
+  else
+    THREAD_LINE="(thread ID unavailable)"
+  fi
   if [[ ! -s "\$AMP_OUTPUT" ]]; then
     echo "(amp produced no output)" > "\$SIMPLEPUSH_MESSAGE"
   elif [[ "\$(wc -c < "\$AMP_OUTPUT")" -gt 900 ]]; then
@@ -473,6 +478,7 @@ if [[ -n "\${FLAMP_SIMPLEPUSH_KEY:-}" ]]; then
   else
     cp "\$AMP_OUTPUT" "\$SIMPLEPUSH_MESSAGE"
   fi
+  printf '\n\n%s\n' "\$THREAD_LINE" >> "\$SIMPLEPUSH_MESSAGE"
   curl -fsSL \
     --data-urlencode "key=\$FLAMP_SIMPLEPUSH_KEY" \
     --data-urlencode "title=flamp deep on $BRANCH" \
