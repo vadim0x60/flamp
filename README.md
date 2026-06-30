@@ -1,5 +1,7 @@
 # flamp
 
+UPD: looks like [amp has now built a version of this into their product](https://ampcode.com/news/agents-in-orbs)
+
 **agentic engineering with wings**
 
 `flamp` runs an [Amp](https://ampcode.com) prompt on a disposable [Fly](http://fly.io/) Machine, commits the result, and pushes it back to your GitHub branch. Launch your agent, close your laptop, get a push notification to your phone when it's done.
